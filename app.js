@@ -52,6 +52,13 @@ function parsePrice(text) {
     return s === '' ? NaN : Number(s);
 }
 
+// Signatures des pages de blocage anti-bot
+const BLOCK_MARKERS = /captcha-delivery\.com|datadome|cf-chl-|challenge-platform|px-captcha|perimeterx/i;
+
+function isBlocked(status, html) {
+    return BLOCK_MARKERS.test(html || '') && (status === 403 || status === 429 || String(html).length < 20000);
+}
+
 // ─────────────────────────────────────────────
 //  UN CYCLE DE CRAWL
 // ─────────────────────────────────────────────
@@ -87,7 +94,7 @@ async function crawlOne() {
     if (!sel.length) return markError('No Selector (' + domain + ')');
     const { selector, subselector } = sel[0];
 
-    let html;
+    let html, status;
     const browser = await puppeteer.launch({
         executablePath: CONFIG.chromePath,
         headless: CONFIG.headless,
@@ -97,7 +104,8 @@ async function crawlOne() {
     });
     try {
         const page = (await browser.pages())[0] || await browser.newPage();
-        await page.goto(row.url, { timeout: 60000, waitUntil: 'networkidle2' });
+        const response = await page.goto(row.url, { timeout: 60000, waitUntil: 'networkidle2' });
+        status = response ? response.status() : null;
         await sleep(3000);
         html = await page.content(); // page complète (head + body)
     } catch (e) {
@@ -105,6 +113,10 @@ async function crawlOne() {
     } finally {
         await browser.close().catch(() => {});
     }
+
+    // Page anti-bot (DataDome & co) : on ne la confond pas avec un prix absent
+    if (isBlocked(status, html)) return markError(`Blocked (${status ?? '?'}/captcha)`);
+    if (status >= 400) return markError(`HTTP ${status}`);
 
     const $ = cheerio.load(html);
     const matches = $(selector);
