@@ -1,222 +1,158 @@
+const fs = require('fs');
+const path = require('path');
+
+// Config : .env (sinon .env.txt) à côté de app.js
+const envFile = [path.join(__dirname, '.env'), path.join(__dirname, '.env.txt')].find(f => fs.existsSync(f));
+require('dotenv').config({ path: envFile, quiet: true });
+
 const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin());
+puppeteer.use(require('puppeteer-extra-plugin-stealth')());
 const cheerio = require('cheerio');
-const sleep = ms => new Promise(res => setTimeout(res, ms));
-const mysql = require('mysql');
+const mysql = require('mysql2/promise');
 const schedule = require('node-schedule');
 
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+
+const CONFIG = {
+    chromePath: process.env.CHROME_PATH || '/usr/bin/google-chrome',
+    userDataDir: path.resolve(__dirname, process.env.CHROME_USERDIR || './puppeteer_profile'),
+    headless: (process.env.HEADLESS || 'true') !== 'false',
+    cron: process.env.CRON || '* * * * *',
+    recrawlSeconds: Number(process.env.RECRAWL_HOURS || 6) * 3600,
+};
+
 // ─────────────────────────────────────────────
-//  CONNEXION MYSQL
+//  CONNEXION MYSQL (pool réutilisé entre les exécutions)
 // ─────────────────────────────────────────────
 
-function getDb() {
-    return mysql.createConnection({
-        host: "test.ma-cave-a-vin.fr",
-        user: "spybenoit",
-        password: "********",
-        database: "spy"
-    });
+const db = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME,
+    connectionLimit: 2,
+});
+
+// ─────────────────────────────────────────────
+//  EXTRACTION DU PRIX
+// ─────────────────────────────────────────────
+
+// "1 753,99 €" / "1.753,99" / "1753.99" / "59€90" → nombre
+function parsePrice(text) {
+    let s = String(text || '').replace(/(\d)\s*€\s*(\d)/, '$1.$2');
+    s = s.replace(/[^0-9.,-]+/g, '');
+    const lastComma = s.lastIndexOf(','), lastDot = s.lastIndexOf('.');
+    if (lastComma > -1 && lastDot > -1) {
+        // le dernier séparateur est la décimale, l'autre est le séparateur de milliers
+        s = lastComma > lastDot ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
+    } else {
+        s = s.replace(',', '.');
+    }
+    s = s.replace(/^\.+|\.+$/g, '');
+    return s === '' ? NaN : Number(s);
 }
 
 // ─────────────────────────────────────────────
-//  TÂCHE PLANIFIÉE
+//  UN CYCLE DE CRAWL
 // ─────────────────────────────────────────────
 
-schedule.scheduleJob('* * * * *', async () => {
+async function crawlOne() {
+    const minTimestamp = Math.floor(Date.now() / 1000) - CONFIG.recrawlSeconds;
+    const [rows] = await db.query(
+        'SELECT * FROM spy WHERE timestamp < ? ORDER BY timestamp ASC LIMIT 1', [minTimestamp]);
 
-    console.log("──────────────────────────────");
-    console.log("🔎 Nouvelle minute → lancement du crawler");
+    if (!rows.length) {
+        console.log('⚠ Aucun enregistrement à crawler.');
+        return;
+    }
+    const row = rows[0];
+    console.log('➡ URL :', row.url, `(id ${row.id})`);
 
-    const db = getDb();
+    // Quoi qu'il arrive, on enregistre le résultat : sinon une URL en erreur
+    // reste la plus ancienne et bloque toute la file indéfiniment.
+    const markError = async (msg) => {
+        await db.query('UPDATE spy SET timestamp=?, price=0, error=? WHERE id=?',
+            [Math.floor(Date.now() / 1000), String(msg).slice(0, 250), row.id]);
+        console.log('⚠', msg);
+    };
 
-    // Connexion MySQL
+    let domain;
     try {
-        db.connect();
-        console.log("✅ MySQL connecté.");
-    } catch (e) {
-        console.log("❌ Erreur MySQL → impossible de se connecter");
-        return;
+        domain = new URL(row.url).hostname;
+    } catch {
+        return markError('URL invalide');
     }
 
-    // Trouver une URL à crawler
-    const mintimestamp = Math.floor(Date.now() / 1000) - 6 * 3600;
-    let urltocrawl = "", idspy = 0, artcode = "", site = "";
+    const [sel] = await db.query('SELECT * FROM spy_selector WHERE site=?', [domain]);
+    if (!sel.length) return markError('No Selector (' + domain + ')');
+    const { selector, subselector } = sel[0];
 
-    try {
-        const query = "SELECT * FROM spy WHERE timestamp < " + mintimestamp + " ORDER BY timestamp ASC LIMIT 1";
-
-        console.log("📝 SQL :", query);
-
-        await new Promise((resolve, reject) => {
-            db.query(query, (err, result) => {
-                if (err) return reject(err);
-
-                if (!result.length) {
-                    console.log("⚠ Aucun enregistrement à crawler.");
-                    resolve();
-                    return;
-                }
-
-                const row = result[0];
-                idspy = row.id;
-                urltocrawl = row.url;
-                artcode = row.artcode;
-                site = row.site;
-
-                console.log("➡ URL trouvée :", urltocrawl);
-
-                resolve();
-            });
-        });
-
-    } catch (e) {
-        console.log("❌ Erreur SQL SELECT :", e);
-        db.end();
-        return;
-    }
-
-    if (!urltocrawl) {
-        db.end();
-        return;
-    }
-
-    // ─────────────────────────────────────────────
-    //  SELECTOR DU SITE
-    // ─────────────────────────────────────────────
-
-    let selector = "", subselector = "", section = "body";
-    let domainname = new URL(urltocrawl).hostname;
-
-    try {
-        await new Promise((resolve, reject) => {
-            db.query("SELECT * FROM spy_selector WHERE site='" + domainname + "'", (err, result) => {
-                if (err) return reject(err);
-
-                if (!result.length) {
-                    console.log("❌ Aucun sélecteur trouvé pour :", domainname);
-                    resolve();
-                    return;
-                }
-
-                selector = result[0].selector;
-                subselector = result[0].subselector;
-                section = result[0].section;
-
-                console.log("✔ pattern:", selector, ", subpattern:", subselector);
-
-                resolve();
-            });
-        });
-
-    } catch (e) {
-        console.log("❌ Erreur SQL selector :", e);
-        db.end();
-        return;
-    }
-
-    if (!selector) {
-        console.log("⚠ Impossible de crawler → pas de pattern");
-        db.end();
-        return;
-    }
-
-    // ─────────────────────────────────────────────
-    //  LANCEMENT PUPPETEER STABLE
-    // ─────────────────────────────────────────────
-
-    let browser;
-
-    try {
-        browser = await puppeteer.launch({
-            executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-            headless: false,
-            userDataDir: 'C:\\Users\\spy\\puppeteer_profile', // profil dédié
-            args: ['--window-size=1920,1080'],
-            defaultViewport: { width: 1920, height: 1080 }
-        });
-    } catch (e) {
-        console.log("❌ Chrome ne démarre pas :", e);
-        db.end();
-        return;
-    }
-
-    console.log("🚀 Chrome lancé (profil dédié OK).");
-
-    const page = (await browser.pages())[0];
-
-    try {
-        await page.goto(urltocrawl, {
-            timeout: 60000,
-            waitUntil: "networkidle2"
-        });
-    } catch (e) {
-        console.log("❌ Impossible d'ouvrir la page :", e.message);
-        await browser.close();
-        db.end();
-        return;
-    }
-
-    await sleep(3000);
-
-    // Récupérer le HTML
-    let bodyHTML = await page.evaluate(() => document.body.innerHTML);
-    let $ = cheerio.load(bodyHTML);
-
-    let quotes = $(selector);
-    let nbquotes = 0;
-    let number = 0;
-
-    quotes.each((i, el) => {
-        nbquotes++;
-        let raw = (subselector === "text")
-            ? $(el).text()
-            : $(el).attr(subselector) || "";
-
-        raw = raw.replace(",", ".").replace("€", ".");
-        raw = raw.replace(/[^0-9.-]+/g, "").trim();
-
-        if (raw.endsWith(".")) raw = raw.slice(0, -1);
-        if (raw.startsWith(".")) raw = raw.slice(1);
-
-        number = Number(raw);
+    let html;
+    const browser = await puppeteer.launch({
+        executablePath: CONFIG.chromePath,
+        headless: CONFIG.headless,
+        userDataDir: CONFIG.userDataDir,
+        args: ['--window-size=1920,1080', '--no-sandbox'],
+        defaultViewport: { width: 1920, height: 1080 },
     });
+    try {
+        const page = (await browser.pages())[0] || await browser.newPage();
+        await page.goto(row.url, { timeout: 60000, waitUntil: 'networkidle2' });
+        await sleep(3000);
+        html = await page.content(); // page complète (head + body)
+    } catch (e) {
+        return markError('Page: ' + e.message);
+    } finally {
+        await browser.close().catch(() => {});
+    }
 
-    console.log("📊 nbQuotes :", nbquotes, "prix détecté :", number);
+    const $ = cheerio.load(html);
+    const matches = $(selector);
+    let price = NaN;
+    if (matches.length === 1) {
+        const el = matches.first();
+        price = parsePrice(subselector === 'text' ? el.text() : el.attr(subselector));
+    }
+    console.log('📊 nbQuotes :', matches.length, '| prix détecté :', price);
 
-    // ─────────────────────────────────────────────
-    //  MISE À JOUR SQL
-    // ─────────────────────────────────────────────
+    if (matches.length !== 1 || isNaN(price) || price <= 0) {
+        return markError('No Price');
+    }
 
     const now = Math.floor(Date.now() / 1000);
+    await db.query("UPDATE spy SET timestamp=?, price=?, error='' WHERE id=?", [now, price, row.id]);
+    await db.query('INSERT INTO history SET timestamp=?, price=?, artcode=?, site=?',
+        [now, price, row.artcode, row.site]);
+    console.log('💾 Prix mis à jour :', price);
+}
 
-    if (nbquotes === 1 && !isNaN(number)) {
-        db.query(
-            "UPDATE spy SET timestamp=?, price=?, error='' WHERE id=?",
-            [now, number, idspy]
-        );
+// ─────────────────────────────────────────────
+//  TÂCHE PLANIFIÉE (sans chevauchement)
+// ─────────────────────────────────────────────
 
-        db.query(
-            "INSERT INTO history SET timestamp=?, price=?, artcode=?, site=?",
-            [now, number, artcode, site]
-        );
+let running = false;
 
-        console.log("💾 Prix mis à jour :", number);
-    } else {
-        db.query(
-            "UPDATE spy SET timestamp=?, price=0, error='No Price' WHERE id=?",
-            [now, idspy]
-        );
-        console.log("⚠ Aucun prix trouvé ou trop de résultats.");
+async function tick() {
+    if (running) {
+        console.log('⏳ Crawl précédent encore en cours, on saute cette minute.');
+        return;
     }
+    running = true;
+    console.log('──────────────────────────────');
+    console.log('🔎', new Date().toLocaleString('fr-FR'), '→ lancement du crawler');
+    try {
+        await crawlOne();
+    } catch (e) {
+        console.log('❌ Erreur :', e.message);
+    } finally {
+        running = false;
+    }
+}
 
-    // ─────────────────────────────────────────────
-    //  FERMETURES PROPRES
-    // ─────────────────────────────────────────────
-
-    await browser.close(); // important: await !
-    db.end();
-
-    console.log("🟢 Fini proprement.");
-
-});
+if (process.argv.includes('--once')) {
+    // Test manuel : node app.js --once
+    tick().finally(() => db.end());
+} else {
+    schedule.scheduleJob(CONFIG.cron, tick);
+    console.log('🟢 Crawler démarré (planning :', CONFIG.cron + ')');
+}
