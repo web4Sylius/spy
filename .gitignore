@@ -1,0 +1,9 @@
+node_modules/
+puppeteer_profile/
+bin/
+obj/
+.env
+.env.txt
+*.bak-*
+screenshot.png
+.vs/
